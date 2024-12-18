@@ -2,9 +2,7 @@ import os
 import pandas as pd
 from urllib.error import HTTPError
 
-save_dir = "weather_data/"
-
-def get_historic_weather_data(state: str, lat: float, lon: float, year: str, force=False):
+def get_historic_weather_data(state: str, lat: float, lon: float, year: str, dir_path: str, force=False):
     
     file_name = save_dir + f"{year}/{state}.csv"
     
@@ -22,7 +20,7 @@ def get_historic_weather_data(state: str, lat: float, lon: float, year: str, for
         df = df.set_index(pd.date_range('1/1/{yr}'.format(yr=year), freq="60"+'Min', periods=int(525600/60)))
         
         # if the folder doesn't exit yet, create it
-        folder_path = f"{save_dir}/{year}"
+        folder_path = f"{dir_path}/{year}"
         os.makedirs(folder_path, exist_ok=True)
         
         # add the lat/lon at the top of the file 

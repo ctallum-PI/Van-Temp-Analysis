@@ -1,7 +1,6 @@
 from os import listdir
 import pickle
 import pandas as pd
-from dataclasses import dataclass
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,93 +21,101 @@ from common import ModelParams, WeatherData, PredictionInput, PredictionOutput
 class Model:
     # model parameters
     def __init__(self, model_params: ModelParams):
+        # make sure we get all the historic data ahead of time, will skip if 
+        # data already exists
+        self.weather_data_path = 'weather_data'
+        self.get_historic_data(2010,2020)
+        
+        # get thermal body parameters
         self.solar_absorptance = model_params.solar_absorptance
         self.heat_transfer_coefficient = model_params.heat_transfer_coefficient
-        self.surface_area = 41.228
         self.thermal_capacity = model_params.thermal_capacity
         self.emissivity = model_params.emissivity
         self.year = model_params.year
+        self.surface_area = 41.228
+        self.Boltzmann_constant = 5.57e-8
         
-        self.get_historic_data(2010,2020)
-        
-        self.weather_data_path = 'weather_data'
-        
+        # set upper and lower operating temperature bounds 
         self.upper_threshold = model_params.threshold
         self.lower_threshold = -20
         
+        # get a list of states
         city_data = pd.read_csv('city locations.csv')
         self.states = city_data["State"].to_list()
+        
+        # get a list of years that we have data for
         self.data_years = listdir(self.weather_data_path)
-        
-        self.Boltzmann_constant = 5.57e-8
-        
-        
+               
     def predict_upper_bound(self,input: WeatherData, t0 = None) -> list[float]:
         """
         Primary math for calculating upper bound of van temperatures
-        """        
+        """ 
+        
+        # unpack input parameters
         temps = input.temps
         ghi = input.GHI
         dni = input.DNI
         angle = input.angle
         
+        # ignore solar angles that are beyond the horizon
         angle = np.minimum(angle, 90)
         
+        # convert to radians from degrees
         angle_rad = angle * (2*3.14/360)
         
+        # calculate diffused horizontal irradiance
         dhi = ghi - dni*np.cos(angle_rad)
                 
-        
+        # assuming that each entry in input data is spaced 1hr apart
         n_hours = len(temps)
         
         times = np.linspace(0, n_hours, n_hours*6, endpoint=False) # every 10 minutes
         dt = times[1] - times[0]
         dt_seconds = dt * 3600
         
+        # if we don't have a specified temp_0 input, we will synch it with ambient temperature to start
         if t0 is None:
             cur_temp = temps[0]
         else:
             cur_temp = t0
         
+        # predicted van temperature array
         van_temp = []
                 
         for t in times:
-            # print(int(t))
-            effective_sa = ghi[int(t)] * 8.274 + dhi[int(t)]*12.34*2 + dni[int(t)]*12.34*np.cos(1.57 - angle_rad[int(t)])
-            # print(effective_sa * self.solar_absorptance)
             
+            # calculate the solar radiation based on surface area and rough approximation due to angled surfaces
+            effective_sr = ghi[int(t)] * 8.274 + dhi[int(t)]*12.34*2 + dni[int(t)]*12.34*np.cos(1.57 - angle_rad[int(t)])
             # Q_solar = self.solar_absorptance * ghi[int(t)] * self.surface_area
-            Q_solar = effective_sa * self.solar_absorptance
-            
-            # print(Q_solar)
-            
-            
+            Q_solar = effective_sr * self.solar_absorptance
+
+            # calculate the energy lost/gained due to convection with the air
             Q_ambient = self.heat_transfer_coefficient * (temps[int(t)] - cur_temp) * self.surface_area
+            
+            # calculate the energy lost/gained to solar radiation
             Q_radiation = self.emissivity * self.Boltzmann_constant * ((temps[int(t)] + 273.15)**4-(cur_temp + 273.15)**4) * self.surface_area
             
+            # calculate the total net energy gain/loss every 10 minutes
             Q_total = Q_solar + Q_ambient + Q_radiation
             
+            # calculate the change in temperature due to the change in energy
             d_temperature = Q_total / self.thermal_capacity * dt_seconds
             
+            # update the current temperature
             cur_temp += d_temperature
-            
             van_temp.append(cur_temp)
 
-        
-        
-        return np.array(van_temp[::6])
-        
-        # return pred_temps
-    
+        return np.array(van_temp[::6]) # convert back form every 10 min to hrs
+
     def predict_lower_bound(self, input: WeatherData) -> list[float]:
         """
         Primary math for calculating the lower bound of van temperatures
         """
+        
+        # realistically, the van should never be getting cooler than ambient temperature
         return input.temps
         
     def run_historic_model(self, year_input: str = None) -> list[PredictionOutput]:
-        
-        
         # get year to calculate
         if year_input is None:
             year = self.year
@@ -169,12 +176,10 @@ class Model:
                     min_van_temp = min(pred_lower_temps),
                 ))
                 
-
             self.save_downtime_csv(pred_output_list, year)
             self.hash_data(year, pred_output_list)
         
             return pred_output_list
-        
         
         if year == 'all':
             # if we are looking at all years, we will recursively call this function,
@@ -280,7 +285,6 @@ class Model:
         
         norm = Normalize(vmin = min_color, vmax=max_color)
         cmap = plt.cm.coolwarm
-
 
         def colorize_state(geometry):
             facecolor = 'black'
@@ -542,9 +546,6 @@ class Model:
         
         df = pd.read_csv(file_path, skiprows=2)
         
-        # datetimes = pd.to_datetime(df[['Year', 'Month', 'Day', 'Hour', 'Minute']])
-        # datetime_list = datetimes.tolist()
-        
         GHI = df['GHI'].astype('float')
         temps = df["Temperature"].astype('float')
         DNI = df["DNI"].astype('float')
@@ -561,7 +562,7 @@ class Model:
             )
         )    
     
-    def compare_to_known(self, path: str) -> list[float]:
+    def compare_to_known(self, path: str) -> None:
         df = pd.read_csv(path)
         
         input = WeatherData(
@@ -569,38 +570,27 @@ class Model:
             DNI = df["DNI"].astype(int),
             temps = df["Temperature"].astype(float),
             angle = df["Solar Zenith Angle"]
-            
         )
         
         actual_temp = df["Van Temp"]
         datetimes = pd.to_datetime(df[['Year', 'Month', 'Day', 'Hour', 'Minute']])
         
         ambient_temp = df["Temperature"]
-        ghi = df["GHI"]
         
-        dni = df["DNI"]
-        angle = df["Solar Zenith Angle"]
-        
-        angle = np.minimum(angle, 90)
-        
-        angle_rad = angle * (2*3.14/360)
-        
-        dhi = ghi - dni*np.cos(angle_rad)
-        
-        effective_sa = ghi* 8.274 + dhi*12.34*2 + dni*12.34*np.cos(1.57 - angle_rad)
+        # some old calcuations for visualizing solar radiaiton
+        # ghi = df["GHI"]
+        # dni = df["DNI"]
+        # angle = df["Solar Zenith Angle"]
+        # angle = np.minimum(angle, 90)
+        # angle_rad = angle * (2*3.14/360)
+        # dhi = ghi - dni*np.cos(angle_rad)
+        # effective_sa = ghi* 8.274 + dhi*12.34*2 + dni*12.34*np.cos(1.57 - angle_rad)
                 
-        
         pred_temp = self.predict_upper_bound(input, t0 = actual_temp[0])
         
         plt.plot(datetimes, actual_temp)
         plt.plot(datetimes, pred_temp)
         plt.plot(datetimes, ambient_temp)
-        # plt.plot(datetimes, ghi * .01* 41.228)
-        # plt.plot(datetimes, effective_sa* .01)
-        
-        # plt.plot(actual_temp)
-        # plt.plot(pred_temp)
-        # plt.plot(ambient_temp)
         
         plt.legend(["Recorded Van Temperature","Predicted Van Temperature", "Ambient Temp"], loc='upper left')
         
@@ -615,7 +605,7 @@ class Model:
         plt.tick_params(axis='x', rotation=45)
         plt.tight_layout()
         
-        plt.savefig("AZ Comparison h=14.png", dpi=300)
+        # plt.savefig("AZ Comparison h=14.png", dpi=300)
         
     def get_historic_data(self, start_year, end_year):
         """
@@ -631,7 +621,7 @@ class Model:
                 state = row['State']
                 latitude = row['Latitude']
                 longitude = row['Longitude']
-                get_historic_weather_data(state, latitude, longitude, year)
+                get_historic_weather_data(state, latitude, longitude, year, self.weather_data_path)
 
     def hash_data(self, year: str, data: list[PredictionOutput]) -> None:
         hash = f"{year}-{self.solar_absorptance}-{self.heat_transfer_coefficient}-{self.thermal_capacity}-{self.emissivity}"
