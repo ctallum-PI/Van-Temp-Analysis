@@ -26,6 +26,9 @@ class PredictionInput:
 class PredictionOutput:
     state: str
     coordinates: tuple[float]
-    predicted_temps: list[float]
-    n_critical_hours: float
+    predicted_upper_temps: list[float]
+    predicted_lower_temps: list[float]
+    n_hours_overtemp: float
+    n_hours_undertemp: float
     max_van_temp: int
+    min_van_temp: int

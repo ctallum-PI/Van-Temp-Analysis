@@ -33,7 +33,8 @@ class Model:
         
         self.weather_data_path = 'weather_data'
         
-        self.threshold = model_params.threshold
+        self.upper_threshold = model_params.threshold
+        self.lower_threshold = -20
         
         city_data = pd.read_csv('city locations.csv')
         self.states = city_data["State"].to_list()
@@ -105,93 +106,143 @@ class Model:
         """
         return input.temps
         
-    def predict_yearly_downtime(self, year: str, save_data = True) -> list[PredictionOutput]:
+    def run_historic_model(self, year_input: str = None) -> list[PredictionOutput]:
         
+        
+        # get year to calculate
+        if year_input is None:
+            year = self.year
+        else:
+            year = year_input 
+            
         # check hashed results
         for hash in os.listdir("hashed_model_results"):
             params = hash.split(".pkl")[0].split("-")
-            if params[0] == year and float(params[2]) == self.solar_absorptance and float(params[3]) == self.heat_transfer_coefficient and float(params[4]) == self.thermal_capacity and float(params[5]) == self.emissivity:
+            
+            # check if the underlying model is the same
+            if params[0] == year and float(params[1]) == self.solar_absorptance and float(params[2]) == self.heat_transfer_coefficient and float(params[3]) == self.thermal_capacity and float(params[4]) == self.emissivity:
+                
                 print("[INFO] Pickled results found, using those instead of re-calculating")
                 with open(f"hashed_model_results/{hash}", 'rb') as f:
-                    data = pickle.load(f)
+                    data: list[PredictionOutput] = pickle.load(f)
                     
-                    # same threshold
-                    if float(params[1]) == self.threshold:
+                    # in case upper threshold is not the same, recalculate upper items
+                    for state_data_idx, state_data in enumerate(data):
+                        # calculate number of hours over-temp
+                        n_hours_overtemp = (state_data.predicted_upper_temps >= self.upper_threshold).sum()
+                        data[state_data_idx].n_hours_overtemp = n_hours_overtemp
                     
-                        self.save_downtime_csv(data, year)
-                        return data
-                    # not same threshold, so recalculate just that element
-                    else:
-                        for state_data_idx, state_data in enumerate(data):
-                            n_critical_hours = (state_data.predicted_temps >= self.threshold).sum()
-                            data[state_data_idx].n_critical_hours = n_critical_hours
-                        
-                        self.save_downtime_csv(data, year)
-                        
-                        return data
+                    self.save_downtime_csv(data, year)
+                    return data
         
+        # if there is not a hashed pickle file, do all the calculations form scratch
         n_states = len(self.states)
         n_years = len(self.data_years)
+        
             
-        if year == 'all':
-            # array to track cumulative downtime across all data years
-            pred_downtime_sum = np.zeros((n_states))
-            pred_max_temp = np.zeros((n_states))
+        # if we are searching for an individual year
+        if year != 'all':
+            pred_output_list = []
             
-            pred_temps = []
-            
-            for year_idx, year in enumerate(self.data_years):
-                output = self.predict_yearly_downtime(year, save_data = True)
-                
-                for idx, state_data in enumerate(output):
-                    pred_downtime_sum[idx] += state_data.n_critical_hours
-                    pred_max_temp[idx] = max(pred_max_temp[idx], state_data.max_van_temp)
-                    
-                    if year_idx == 0:
-                        pred_temps.append(state_data.predicted_temps)
-                    else:
-                        pred_temps[idx] += state_data.predicted_temps
-                    
-                    
-            pred_downtime_avg = pred_downtime_sum / n_years
-            avg_temps = [sum_temps/n_years for sum_temps in pred_temps]
-            
-            # overwrite data and save
-            for idx, state_data in enumerate(output):
-                state_data.n_critical_hours = pred_downtime_avg[idx]
-                state_data.max_van_temp = pred_max_temp[idx]
-                state_data.predicted_temps = avg_temps[idx]
-                
-                
-            self.save_downtime_csv(output, 'all')
-            
-            # self.hash_data("all",output)
-            
-            return output
-            
-        else:
-            pred_downtime = []
+            # iterate through each US state
             for state in tqdm(self.states):
+                
+                # get the weather data for the state
                 data = self.load_state_data(state, year)
-                predicted_temps = self.predict_upper_bound(data.weather_data)
                 
-                n_critical_hours = (predicted_temps >= self.threshold).sum()
+                # make predictions on temperature for the state
+                pred_upper_temps = self.predict_upper_bound(data.weather_data)
+                pred_lower_temps = self.predict_lower_bound(data.weather_data)
                 
-                pred_downtime.append(PredictionOutput(
+                # sum the hours each US state is above and below the thresholds
+                n_hours_overtemp = (pred_upper_temps >= self.upper_threshold).sum()
+                n_hours_undertemp = (pred_lower_temps <= self.lower_threshold).sum()
+                
+                pred_output_list.append(PredictionOutput(
                     state = data.state,
                     coordinates = data.coordinates,
-                    predicted_temps = predicted_temps,
-                    n_critical_hours = n_critical_hours,
-                    max_van_temp = max(predicted_temps)
+                    predicted_upper_temps = pred_upper_temps,
+                    predicted_lower_temps = pred_lower_temps,
+                    n_hours_overtemp = n_hours_overtemp,
+                    n_hours_undertemp = n_hours_undertemp,
+                    max_van_temp = max(pred_upper_temps),
+                    min_van_temp = min(pred_lower_temps),
                 ))
                 
-            if save_data:
-                self.save_downtime_csv(pred_downtime, year)
-                self.hash_data(year, pred_downtime)
+
+            self.save_downtime_csv(pred_output_list, year)
+            self.hash_data(year, pred_output_list)
         
-            return pred_downtime
+            return pred_output_list
         
-    def save_downtime_csv(self, pred_data:list[PredictionInput], year: str, path_base: str = "predicted_downtime") -> None:
+        
+        if year == 'all':
+            # if we are looking at all years, we will recursively call this function,
+            # gather all the data, and then average it all
+
+            # create a counter array with each slot allocated for each of the states
+            pred_hours_overtemp = np.zeros((n_states))
+            pred_hours_undertemp = np.zeros((n_states))
+            pred_max_temp = np.zeros((n_states))
+            pred_min_temp = np.zeros((n_states))
+            
+            pred_upper_temps = []
+            pred_lower_temps = []
+            
+            # iterate through each of the years
+            for year_idx, recursive_year in enumerate(self.data_years):
+                
+                # recursively call this function to get individual year data
+                output = self.run_historic_model(recursive_year)
+                
+                # now go through each US State in a specific year
+                for state_idx, state_data in enumerate(output):
+                    # add number of hours outside of threshold
+                    pred_hours_overtemp[state_idx] += state_data.n_hours_overtemp
+                    pred_hours_undertemp[state_idx] += state_data.n_hours_undertemp
+                    
+                    # now keep looking for maximum and minimum temperatures for the year
+                    pred_max_temp[state_idx] = max(pred_max_temp[state_idx], state_data.max_van_temp)
+                    pred_min_temp[state_idx] = min(pred_min_temp[state_idx], state_data.min_van_temp)
+                    
+                    # if this is the first year, populate the pred_temp lists with the predicted 
+                    # temps for each US State 
+                    if year_idx == 0:
+                        pred_upper_temps.append(state_data.predicted_upper_temps)
+                        pred_lower_temps.append(state_data.predicted_lower_temps)
+                    # for each other iteration, add new array to previous array
+                    # dimensions should line up
+                    else:
+                        pred_upper_temps[state_idx] += state_data.predicted_upper_temps
+                        pred_lower_temps[state_idx] += state_data.predicted_lower_temps
+                    
+            # now calculate averages for everything
+            n_hours_overtemp_avg = pred_hours_overtemp / n_years
+            n_hours_undertemp_avg = pred_hours_undertemp/ n_years
+            
+            pred_upper_temps_avg = [upper_temps / n_years for upper_temps in pred_upper_temps]
+            pred_lower_temps_avg = [lower_temps / n_years for lower_temps in pred_lower_temps]
+            
+            # overwrite data and save using some info from last "output" year data
+            all_year_output = []
+            for state_idx in range(n_states):
+                
+                all_year_output.append(PredictionOutput(
+                    state = output[state_idx].state,
+                    coordinates = output[state_idx].coordinates,
+                    predicted_upper_temps = pred_upper_temps_avg[state_idx],
+                    predicted_lower_temps = pred_lower_temps_avg[state_idx],
+                    n_hours_overtemp = n_hours_overtemp_avg[state_idx],
+                    n_hours_undertemp = n_hours_undertemp_avg[state_idx], 
+                    max_van_temp = pred_max_temp[state_idx],
+                    min_van_temp = pred_min_temp[state_idx]
+                ))
+                
+            self.save_downtime_csv(all_year_output, 'all')
+            
+            return all_year_output
+        
+    def save_downtime_csv(self, pred_data:list[PredictionOutput], year: str) -> None:
         """
         Save predicted data as a CSV
         """
@@ -200,19 +251,16 @@ class Model:
         df["Latitude"] = [data.coordinates[0] for data in pred_data]
         df["Longitude"] = [data.coordinates[1] for data in pred_data]
         df["Max Temp"] = [int(data.max_van_temp) for data in pred_data]
-        df["Critical Hours"] = [int(data.n_critical_hours) for data in pred_data]
+        df["Min Temp"] = [int(data.min_van_temp) for data in pred_data]
+        df["Num Hours Overtemp"] = [int(data.n_hours_overtemp) for data in pred_data]
+        df["Num hours Undertemp"] = [int(data.n_hours_undertemp) for data in pred_data]
         
-        if year == "all":
-            year_str = f"{self.data_years[0]}-{self.data_years[-1]}"
-        else:
-            year_str = year
-        
-        filename = f"csv_results/{year}-{self.threshold}-{self.solar_absorptance}-{self.heat_transfer_coefficient}-{self.thermal_capacity}-{self.emissivity}.csv"
-        # filename =f"{path_base}_{year_str}.csv" 
+        # same as hash, but manually to avoid issues with recursion in other functions
+        filename = f"csv_results/{year}-{self.upper_threshold}-{self.solar_absorptance}-{self.heat_transfer_coefficient}-{self.thermal_capacity}-{self.emissivity}.csv"
         
         df.to_csv(filename, index=False,lineterminator='\n')
   
-    def plot_downtime(self, pred_data_list: list[PredictionOutput], save_fig = False) -> None:
+    def plot_hrs_overtemp(self, pred_data_list: list[PredictionOutput], save_fig = False) -> None:
         """
         Plot a map of US states and downtime
         """
@@ -227,8 +275,8 @@ class Model:
         states_shp = shpreader.natural_earth(resolution='110m', category='cultural', name=shapename)
 
         # setup up color data
-        min_color = min(pred_data_list, key = lambda data: data.n_critical_hours).n_critical_hours
-        max_color = max(pred_data_list, key = lambda data: data.n_critical_hours).n_critical_hours
+        min_color = min(pred_data_list, key = lambda data: data.n_hours_overtemp).n_hours_overtemp
+        max_color = max(pred_data_list, key = lambda data: data.n_hours_overtemp).n_hours_overtemp
         
         norm = Normalize(vmin = min_color, vmax=max_color)
         cmap = plt.cm.coolwarm
@@ -240,7 +288,7 @@ class Model:
                 latitude = state_data.coordinates[0]
                 longitude = state_data.coordinates[1]
                 if geometry.contains(sgeom.Point(longitude, latitude)):
-                    color = list(cmap(norm(state_data.n_critical_hours)))
+                    color = list(cmap(norm(state_data.n_hours_overtemp)))
                     
                     facecolor = (color[0], color[1], color[2])            
             return {'facecolor': facecolor, 'edgecolor': 'black'}
@@ -251,16 +299,16 @@ class Model:
                 styler=colorize_state)
         
         # get top 5 states
-        pred_data_list.sort(key=lambda item: item.n_critical_hours, reverse=True)
+        pred_data_list.sort(key=lambda item: item.n_hours_overtemp, reverse=True)
         
         n_states = 5
                 
         proxy_artists = []
         labels = []
         for state_data in pred_data_list[0:n_states]:
-            color = list(cmap(norm(state_data.n_critical_hours)))[0:3]
+            color = list(cmap(norm(state_data.n_hours_overtemp)))[0:3]
             proxy_artists.append(mpatches.Rectangle((0,0), 1,1, facecolor=color))
-            labels.append(f"{state_data.state}: {int(state_data.n_critical_hours)}hrs")
+            labels.append(f"{state_data.state}: {int(state_data.n_hours_overtemp)}hrs")
 
         ax.legend(proxy_artists, labels,
                 loc='lower left', bbox_to_anchor=(0.025, -0.1), fancybox=True, title=f'States with most hours')
@@ -270,15 +318,82 @@ class Model:
         else:
             year_str = year
         
-        title_str = f"Number of Predicted Hours Yearly Exceeding {self.threshold}°C Using {year_str} Data"
+        title_str = f"Number of Predicted Hours Yearly Exceeding {self.upper_threshold}°C Using {year_str} Data"
         
         plt.title(title_str)
         
         if save_fig:
             hash = self.get_hash()
-            file_name = f"results/downtime-{hash}.png"
+            file_name = f"results/overtemp_hrs-{hash}-{self.upper_threshold}.png"
             fig.savefig(file_name,dpi=300)
-            
+        
+    def plot_hrs_undertemp(self, pred_data_list: list[PredictionOutput], save_fig = False) -> None:
+        """
+        Plot a map of US states and downtime
+        """
+        year = self.year
+        
+        fig = plt.figure()
+
+        ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(), frameon=False)
+        ax.patch.set_visible(False)
+        ax.set_extent([-125, -66.5, 20, 50], ccrs.Geodetic())
+        shapename = 'admin_1_states_provinces_lakes'
+        states_shp = shpreader.natural_earth(resolution='110m', category='cultural', name=shapename)
+
+        # setup up color data
+        min_color = min(pred_data_list, key = lambda data: data.n_hours_undertemp).n_hours_undertemp
+        max_color = max(pred_data_list, key = lambda data: data.n_hours_undertemp).n_hours_undertemp
+        
+        norm = Normalize(vmin = min_color, vmax=max_color)
+        cmap = plt.cm.coolwarm
+
+
+        def colorize_state(geometry):
+            facecolor = 'black'
+            for state_data in pred_data_list:
+                latitude = state_data.coordinates[0]
+                longitude = state_data.coordinates[1]
+                if geometry.contains(sgeom.Point(longitude, latitude)):
+                    color = list(cmap(norm(state_data.n_hours_undertemp)))
+                    
+                    facecolor = (color[0], color[1], color[2])            
+            return {'facecolor': facecolor, 'edgecolor': 'black'}
+
+        ax.add_geometries(
+                shpreader.Reader(states_shp).geometries(),
+                ccrs.PlateCarree(),
+                styler=colorize_state)
+        
+        # get top 5 states
+        pred_data_list.sort(key=lambda item: item.n_hours_undertemp, reverse=True)
+        
+        n_states = 5
+                
+        proxy_artists = []
+        labels = []
+        for state_data in pred_data_list[0:n_states]:
+            color = list(cmap(norm(state_data.n_hours_undertemp)))[0:3]
+            proxy_artists.append(mpatches.Rectangle((0,0), 1,1, facecolor=color))
+            labels.append(f"{state_data.state}: {int(state_data.n_hours_undertemp)}hrs")
+
+        ax.legend(proxy_artists, labels,
+                loc='lower left', bbox_to_anchor=(0.025, -0.1), fancybox=True, title=f'States with most hours')
+        
+        if year == 'all':
+            year_str = f"{self.data_years[0]}-{self.data_years[-1]}"
+        else:
+            year_str = year
+        
+        title_str = f"Number of Predicted Hours Yearly Under {self.lower_threshold}°C Using {year_str} Data"
+        
+        plt.title(title_str)
+        
+        if save_fig:
+            hash = self.get_hash()
+            file_name = f"results/undertemp_hrs-{hash}-{self.lower_threshold}.png"
+            fig.savefig(file_name,dpi=300)
+        
     def plot_max_temps(self, pred_data_list: list[PredictionOutput], save_fig = False) -> None:
         """
         Plot a map of US states and downtime
@@ -346,6 +461,73 @@ class Model:
             file_name = f"results/maximum-{hash}.png"
             fig.savefig(file_name,dpi=300)
             
+    def plot_min_temps(self, pred_data_list: list[PredictionOutput], save_fig: bool = False) -> None:
+        """
+        Plot a map of US states and downtime
+        """
+        year = self.year
+        
+        fig = plt.figure()
+
+        ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(), frameon=False)
+        ax.patch.set_visible(False)
+        ax.set_extent([-125, -66.5, 20, 50], ccrs.Geodetic())
+        shapename = 'admin_1_states_provinces_lakes'
+        states_shp = shpreader.natural_earth(resolution='110m', category='cultural', name=shapename)
+
+        # setup up color data
+        min_color = min(pred_data_list, key = lambda data: data.min_van_temp).min_van_temp
+        max_color = max(pred_data_list, key = lambda data: data.min_van_temp).min_van_temp
+
+        norm = Normalize(vmin = min_color, vmax=max_color)
+        cmap = plt.cm.coolwarm_r
+
+
+        def colorize_state(geometry):
+            facecolor = 'black'
+            for state_data in pred_data_list:
+                latitude = state_data.coordinates[0]
+                longitude = state_data.coordinates[1]
+                if geometry.contains(sgeom.Point(longitude, latitude)):
+                    color = list(cmap(norm(state_data.min_van_temp)))
+                    
+                    facecolor = (color[0], color[1], color[2])            
+            return {'facecolor': facecolor, 'edgecolor': 'black'}
+
+        ax.add_geometries(
+                shpreader.Reader(states_shp).geometries(),
+                ccrs.PlateCarree(),
+                styler=colorize_state)
+        
+        # get top 5 states
+        pred_data_list.sort(key=lambda item: item.min_van_temp, reverse=False)
+        
+        n_states = 5
+                
+        proxy_artists = []
+        labels = []
+        for state_data in pred_data_list[0:n_states]:
+            color = list(cmap(norm(state_data.min_van_temp)))[0:3]
+            proxy_artists.append(mpatches.Rectangle((0,0), 1,1, facecolor=color))
+            labels.append(f"{state_data.state}: {int(state_data.min_van_temp)}°C")
+
+        ax.legend(proxy_artists, labels,
+                loc='lower left', bbox_to_anchor=(0.025, -0.1), fancybox=True, title=f'Lowest temperatures')
+        
+        if year == 'all':
+            year_str = f"{self.data_years[0]}-{self.data_years[-1]}"
+        else:
+            year_str = year
+        
+        title_str = f"Minimum Temperature Predicted Across States Using {year_str} Data"
+        
+        plt.title(title_str)
+        
+        if save_fig:
+            hash = self.get_hash()
+            file_name = f"results/minimum-{hash}.png"
+            fig.savefig(file_name,dpi=300)
+                 
     def load_state_data(self, state: str, year: str) -> PredictionInput:
         """
         Load historic weather file
@@ -435,9 +617,6 @@ class Model:
         
         plt.savefig("AZ Comparison h=14.png", dpi=300)
         
-
-        
-        
     def get_historic_data(self, start_year, end_year):
         """
         Pull from DSRDB API to get weather data
@@ -455,13 +634,12 @@ class Model:
                 get_historic_weather_data(state, latitude, longitude, year)
 
     def hash_data(self, year: str, data: list[PredictionOutput]) -> None:
-        hash = f"{year}-{self.threshold}-{self.solar_absorptance}-{self.heat_transfer_coefficient}-{self.thermal_capacity}-{self.emissivity}"
+        hash = f"{year}-{self.solar_absorptance}-{self.heat_transfer_coefficient}-{self.thermal_capacity}-{self.emissivity}"
         
         with open(f"hashed_model_results/{hash}.pkl", 'wb') as f:
             pickle.dump(data, f)
         
-      
     def get_hash(self) -> str:
-        hash = f"{self.year}-{self.threshold}-{self.solar_absorptance}-{self.heat_transfer_coefficient}-{self.thermal_capacity}-{self.emissivity}"
+        hash = f"{self.year}-{self.solar_absorptance}-{self.heat_transfer_coefficient}-{self.thermal_capacity}-{self.emissivity}"
         
         return hash
