@@ -4,7 +4,7 @@ from urllib.error import HTTPError
 
 def get_historic_weather_data(state: str, lat: float, lon: float, year: str, dir_path: str, force=False):
     
-    file_name = save_dir + f"{year}/{state}.csv"
+    file_name = dir_path + f"/{year}/{state}.csv"
     
     # if the file exists already, and we are not force collecting, return
     if os.path.exists(file_name) and not force:

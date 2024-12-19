@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 
 @dataclass
 class ModelParams:
@@ -11,6 +12,7 @@ class ModelParams:
 
 @dataclass
 class WeatherData:
+    date: list[datetime]
     GHI: list[int]
     DNI: list[int]
     angle: float
@@ -26,6 +28,7 @@ class PredictionInput:
 class PredictionOutput:
     state: str
     coordinates: tuple[float]
+    date: list[datetime]
     predicted_upper_temps: list[float]
     predicted_lower_temps: list[float]
     n_hours_overtemp: float

@@ -45,6 +45,9 @@ class Model:
         
         # get a list of years that we have data for
         self.data_years = listdir(self.weather_data_path)
+        
+        # set valid work hours 
+        self.work_hours = range(6, 22) # 6am to 10pm
                
     def predict_upper_bound(self,input: WeatherData, t0 = None) -> list[float]:
         """
@@ -115,32 +118,35 @@ class Model:
         # realistically, the van should never be getting cooler than ambient temperature
         return input.temps
         
-    def run_historic_model(self, year_input: str = None) -> list[PredictionOutput]:
+    def run_historic_model(self, year_input: str = None, force=False) -> list[PredictionOutput]:
         # get year to calculate
         if year_input is None:
             year = self.year
         else:
             year = year_input 
             
+        
         # check hashed results
-        for hash in os.listdir("hashed_model_results"):
-            params = hash.split(".pkl")[0].split("-")
-            
-            # check if the underlying model is the same
-            if params[0] == year and float(params[1]) == self.solar_absorptance and float(params[2]) == self.heat_transfer_coefficient and float(params[3]) == self.thermal_capacity and float(params[4]) == self.emissivity:
+        if not force:
+            for hash in os.listdir("hashed_model_results"):
+                params = hash.split(".pkl")[0].split("-")
                 
-                print("[INFO] Pickled results found, using those instead of re-calculating")
-                with open(f"hashed_model_results/{hash}", 'rb') as f:
-                    data: list[PredictionOutput] = pickle.load(f)
+                # check if the underlying model is the same
+                if params[0] == year and float(params[1]) == self.solar_absorptance and float(params[2]) == self.heat_transfer_coefficient and float(params[3]) == self.thermal_capacity and float(params[4]) == self.emissivity:
                     
-                    # in case upper threshold is not the same, recalculate upper items
-                    for state_data_idx, state_data in enumerate(data):
-                        # calculate number of hours over-temp
-                        n_hours_overtemp = (state_data.predicted_upper_temps >= self.upper_threshold).sum()
-                        data[state_data_idx].n_hours_overtemp = n_hours_overtemp
+                    print("[INFO] Pickled results found, using those instead of re-calculating")
                     
-                    self.save_downtime_csv(data, year)
-                    return data
+                    with open(f"hashed_model_results/{hash}", 'rb') as f:
+                        pickled_data: list[PredictionOutput] = pickle.load(f)
+                        
+                        # in case upper threshold is not the same, recalculate upper items
+                        for state_data_idx, state_data in enumerate(pickled_data):
+                            # calculate number of hours over-temp
+                            n_hours_overtemp = (state_data.predicted_upper_temps >= self.upper_threshold).sum()
+                            pickled_data[state_data_idx].n_hours_overtemp = n_hours_overtemp
+                        
+                        self.save_downtime_csv(pickled_data, year)
+                        return pickled_data
         
         # if there is not a hashed pickle file, do all the calculations form scratch
         n_states = len(self.states)
@@ -161,13 +167,18 @@ class Model:
                 pred_upper_temps = self.predict_upper_bound(data.weather_data)
                 pred_lower_temps = self.predict_lower_bound(data.weather_data)
                 
+                # get times
+                date = data.weather_data.date
+                driving_time = np.array([True if time.time().hour in self.work_hours else False for time in date])
+
                 # sum the hours each US state is above and below the thresholds
-                n_hours_overtemp = (pred_upper_temps >= self.upper_threshold).sum()
-                n_hours_undertemp = (pred_lower_temps <= self.lower_threshold).sum()
+                n_hours_overtemp = ((pred_upper_temps >= self.upper_threshold) & driving_time).sum()
+                n_hours_undertemp = ((pred_lower_temps <= self.lower_threshold) & driving_time).sum()
                 
                 pred_output_list.append(PredictionOutput(
                     state = data.state,
                     coordinates = data.coordinates,
+                    date = data.weather_data.date,
                     predicted_upper_temps = pred_upper_temps,
                     predicted_lower_temps = pred_lower_temps,
                     n_hours_overtemp = n_hours_overtemp,
@@ -198,7 +209,7 @@ class Model:
             for year_idx, recursive_year in enumerate(self.data_years):
                 
                 # recursively call this function to get individual year data
-                output = self.run_historic_model(recursive_year)
+                output = self.run_historic_model(recursive_year, force)
                 
                 # now go through each US State in a specific year
                 for state_idx, state_data in enumerate(output):
@@ -235,6 +246,7 @@ class Model:
                 all_year_output.append(PredictionOutput(
                     state = output[state_idx].state,
                     coordinates = output[state_idx].coordinates,
+                    date = output[state_idx].date,
                     predicted_upper_temps = pred_upper_temps_avg[state_idx],
                     predicted_lower_temps = pred_lower_temps_avg[state_idx],
                     n_hours_overtemp = n_hours_overtemp_avg[state_idx],
@@ -551,10 +563,13 @@ class Model:
         DNI = df["DNI"].astype('float')
         angle = df["Solar Zenith Angle"].astype('float')
         
+        date = pd.to_datetime(df[['Year', 'Month', 'Day', 'Hour', 'Minute']]).to_list()
+        
         return PredictionInput(
             state = state,
             coordinates = (latitude, longitude),
             weather_data = WeatherData(
+                date = date,
                 GHI = GHI,
                 DNI = DNI,
                 temps = temps,
