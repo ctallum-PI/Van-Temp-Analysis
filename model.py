@@ -83,14 +83,15 @@ class Model:
             cur_temp = t0
         
         # predicted van temperature array
-        van_temp = []
+        van_temp = np.zeros((n_hours))
                 
         for t in times:
             
+            if t%1 == 0:
             # calculate the solar radiation based on surface area and rough approximation due to angled surfaces
-            effective_sr = ghi[int(t)] * 8.274 + dhi[int(t)]*12.34*2 + dni[int(t)]*12.34*np.cos(1.57 - angle_rad[int(t)])
-            # Q_solar = self.solar_absorptance * ghi[int(t)] * self.surface_area
-            Q_solar = effective_sr * self.solar_absorptance
+                effective_sr = ghi[int(t)] * 8.274 + dhi[int(t)]*12.34*2 + dni[int(t)]*12.34*np.cos(1.57 - angle_rad[int(t)])
+                # Q_solar = self.solar_absorptance * ghi[int(t)] * self.surface_area
+                Q_solar = effective_sr * self.solar_absorptance
 
             # calculate the energy lost/gained due to convection with the air
             Q_ambient = self.heat_transfer_coefficient * (temps[int(t)] - cur_temp) * self.surface_area
@@ -106,9 +107,11 @@ class Model:
             
             # update the current temperature
             cur_temp += d_temperature
-            van_temp.append(cur_temp)
+            
+            if t%1 == 0:
+                van_temp[int(t)] = cur_temp
 
-        return np.array(van_temp[::6]) # convert back form every 10 min to hrs
+        return van_temp
 
     def predict_lower_bound(self, input: WeatherData) -> list[float]:
         """
